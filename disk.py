@@ -56,6 +56,7 @@ class DSSDisk:
                 data, addr = self.m_socket.recvfrom(1024)
                 message = data.decode('utf-8')
                 print(f"M-port received: {message}")
+
             except Exception as e:
                 print(f"M-port error: {e}")
     
@@ -66,6 +67,7 @@ class DSSDisk:
                 data, addr = self.c_socket.recvfrom(1024)
                 message = data.decode('utf-8')
                 print(f"C-port received: {message}")
+
             except Exception as e:
                 print(f"C-port error: {e}")
     
@@ -75,6 +77,13 @@ class DSSDisk:
             while True:
                 cmd = input("Type 'quit' to exit: ").strip()
                 if cmd == "quit":
+                    # Deregistering
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    message = f"deregister-disk|{self.diskname}"
+                    sock.sendto(message.encode('utf-8'), (self.manager_ip, self.manager_port))
+                    response, _ = sock.recvfrom(1024)
+                    print(f"Deregistration response: {response.decode('utf-8')}")
+                    sock.close()
                     break
         except KeyboardInterrupt:
             pass
