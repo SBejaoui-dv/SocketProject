@@ -1,8 +1,10 @@
 # manager.py
 # Rishith Cheduluri (1225443687) and Sebastian Bejaoui (122)
-# manager.py
 import socket
 import sys
+# For DSS
+import threading
+import json
 
 class DSSManager:
     def __init__(self, port):
@@ -89,6 +91,50 @@ class DSSManager:
         }
         
         print(f"Disk {diskname} registered")
+        return "SUCCESS"
+    
+    def configure_dss(self, params):
+        """Handle configure-dss command"""
+        if len(params) != 3:
+            return "FAILURE|Invalid parameters"
+        
+        dss_name, n, striping_unit = params
+        n = int(n)
+        striping_unit = int(striping_unit)
+        
+        # Validating
+        if n < 3:
+            return "FAILURE|n must be >= 3"
+        
+        if dss_name in self.dsss:
+            return "FAILURE|DSS already exists"
+        
+        # Checking if theres enough free disks
+        free_disks = [name for name, info in self.disks.items() if info['status'] == 'Free']
+        if len(free_disks) < n:
+            return "FAILURE|Not enough free disks"
+        
+        # Checking if the striping unit is power of 2 and in range
+        if not (128 <= striping_unit <= 1048576 and (striping_unit & (striping_unit - 1)) == 0):
+            return "FAILURE|Invalid striping unit"
+        
+        # Selecting 'n' disks randomly
+        import random
+        selected_disks = random.sample(free_disks, n)
+        
+        # Updating the disk status
+        for disk_name in selected_disks:
+            self.disks[disk_name]['status'] = 'InDSS'
+        
+        # Creating the DSS
+        self.dsss[dss_name] = {
+            'disks': selected_disks,
+            'n': n,
+            'striping_unit': striping_unit,
+            'files': {}
+        }
+        
+        print(f"DSS {dss_name} configured with disks: {selected_disks}")
         return "SUCCESS"
     
     def deregister_user(self, params):
