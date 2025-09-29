@@ -46,6 +46,8 @@ class DSSManager:
             return self.deregister_user(parts[1:])
         elif command == "deregister-disk":
             return self.deregister_disk(parts[1:])
+        elif command == "configure-dss":
+            return self.configure_dss(parts[1:])
         else:
             return "FAILURE|Unknown command"
     
