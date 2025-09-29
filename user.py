@@ -20,7 +20,7 @@ class DSSUser:
         
         print(f"User {username} started on ports {m_port}, {c_port}")
         
-        # Registering with hte manager
+        # Registering with the manager
         self.register()
     
     def register(self):
@@ -34,6 +34,15 @@ class DSSUser:
         print(f"Registration response: {response.decode('utf-8')}")
         sock.close()
     
+    def send_command(self, command):
+        """Send command to manager"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(command.encode('utf-8'), (self.manager_ip, self.manager_port))
+        
+        response, _ = sock.recvfrom(1024)
+        print(f"Response: {response.decode('utf-8')}")
+        sock.close()
+    
     def run(self):
         """Interactive command loop"""
         print("Available commands: configure-dss, deregister-user, quit")
@@ -41,7 +50,11 @@ class DSSUser:
         while True:
             try:
                 cmd = input(f"{self.username}> ").strip()
-                print("Command processing not implemented yet")
+                
+                if cmd == "quit":
+                    break
+                else:
+                    print("Command processing not fully implemented")
                     
             except KeyboardInterrupt:
                 break
