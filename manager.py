@@ -1,5 +1,6 @@
 # manager.py
 # Rishith Cheduluri (1225443687) and Sebastian Bejaoui (122)
+# manager.py
 import socket
 import sys
 
@@ -37,8 +38,12 @@ class DSSManager:
         
         if command == "register-user":
             return self.register_user(parts[1:])
+        elif command == "register-disk":
+            return self.register_disk(parts[1:])
         elif command == "deregister-user":
             return self.deregister_user(parts[1:])
+        elif command == "deregister-disk":
+            return self.deregister_disk(parts[1:])
         else:
             return "FAILURE|Unknown command"
     
@@ -49,11 +54,11 @@ class DSSManager:
         
         username, ip, m_port, c_port = params
         
-        # Checking if teh user already exists
+        # Checking if the user already exists
         if username in self.users:
             return "FAILURE|User already registered"
-
-
+        
+        
         # Storing the user info
         self.users[username] = {
             'ip': ip,
@@ -62,6 +67,28 @@ class DSSManager:
         }
         
         print(f"User {username} registered")
+        return "SUCCESS"
+    
+    def register_disk(self, params):
+        """Handle register-disk command"""
+        if len(params) != 4:
+            return "FAILURE|Invalid parameters"
+        
+        diskname, ip, m_port, c_port = params
+        
+        # Checking ifthe disk already exists
+        if diskname in self.disks:
+            return "FAILURE|Disk already registered"
+        
+        # Storing the disk info
+        self.disks[diskname] = {
+            'ip': ip,
+            'm_port': int(m_port),
+            'c_port': int(c_port),
+            'status': 'Free'
+        }
+        
+        print(f"Disk {diskname} registered")
         return "SUCCESS"
     
     def deregister_user(self, params):
@@ -75,6 +102,22 @@ class DSSManager:
         
         del self.users[username]
         print(f"User {username} deregistered")
+        return "SUCCESS"
+    
+    def deregister_disk(self, params):
+        """Handle deregister-disk command"""
+        if len(params) != 1:
+            return "FAILURE|Invalid parameters"
+        
+        diskname = params[0]
+        if diskname not in self.disks:
+            return "FAILURE|Disk not found"
+        
+        if self.disks[diskname]['status'] == 'InDSS':
+            return "FAILURE|Disk is in use"
+        
+        del self.disks[diskname]
+        print(f"Disk {diskname} deregistered")
         return "SUCCESS"
 
 if __name__ == "__main__":
