@@ -2,6 +2,7 @@
 # Rishith Cheduluri (1225443687) and Sebastian Bejaoui (122)
 import socket
 import sys
+import threading
 
 class DSSUser:
     def __init__(self, username, manager_ip, manager_port, m_port, c_port):
@@ -52,9 +53,13 @@ class DSSUser:
                 cmd = input(f"{self.username}> ").strip()
                 
                 if cmd == "quit":
+                    # Deregister before quitting
+                    self.send_command(f"deregister-user|{self.username}")
                     break
+                elif cmd.startswith("configure-dss"):
+                    self.send_command(cmd.replace(" ", "|"))
                 else:
-                    print("Command processing not fully implemented")
+                    print("Unknown command")
                     
             except KeyboardInterrupt:
                 break
