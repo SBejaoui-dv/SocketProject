@@ -73,6 +73,13 @@ class DSSUser:
         while True:
             try:
                 cmd = input(f"{self.username}> ").strip()
+                # Normalize any pasted Unicode dashes into ASCII '-'
+                cmd = (cmd.replace('\u2010', '-')
+                       .replace('\u2011', '-')
+                       .replace('\u2012', '-')
+                       .replace('\u2013', '-')
+                       .replace('\u2014', '-')
+                       .replace('\u2212', '-'))
 
                 if cmd == "quit":
                     # Best-effort deregister self before quitting
@@ -80,7 +87,7 @@ class DSSUser:
                     if "SUCCESS" in resp:
                         self.close()
                         sys.exit(0)
-                    break
+                    break  # even if failure, leave loop
 
                 elif cmd.startswith("configure-dss"):
                     parts = cmd.split()
@@ -110,6 +117,7 @@ class DSSUser:
 
                     # Send exactly what the manager expects
                     self.send_command(f"configure-dss|{dss_name}|{n}|{su}")
+                    continue  # <- prevent falling through to "Unknown command"
 
                 elif cmd.startswith("deregister-user"):
                     # Accept both "deregister-user" and "deregister-user <name>"
@@ -119,9 +127,11 @@ class DSSUser:
                     if target == self.username and "SUCCESS" in resp:
                         self.close()
                         sys.exit(0)
+                    continue  # keep REPL alive if deregistering someone else
 
                 else:
                     print("Unknown command")
+                    continue
 
             except KeyboardInterrupt:
                 # Try to deregister on Ctrl+C for the current user, then exit
