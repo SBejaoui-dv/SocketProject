@@ -25,16 +25,14 @@ class DSSUser:
         # Registering with the manager
         self.register()
 
-    def register(self):
-        """Register with the manager"""
-        message = f"register-user|{self.username}|127.0.0.1|{self.m_port}|{self.c_port}"
+    # ---------- helpers ----------
+    @staticmethod
+    def _is_power_of_two(x: int) -> bool:
+        return x > 0 and (x & (x - 1)) == 0
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.sendto(message.encode('utf-8'), (self.manager_ip, self.manager_port))
-
-        response, _ = sock.recvfrom(1024)
-        print(f"Registration response: {response.decode('utf-8')}")
-        sock.close()
+    @staticmethod
+    def _valid_name(s: str) -> bool:
+        return s.isalpha() and len(s) <= 15
 
     def close(self):
         """Close sockets gracefully"""
@@ -47,43 +45,77 @@ class DSSUser:
         except Exception:
             pass
 
+    # ---------- network ops ----------
+    def register(self):
+        """Register with the manager"""
+        message = f"register-user|{self.username}|127.0.0.1|{self.m_port}|{self.c_port}"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(message.encode('utf-8'), (self.manager_ip, self.manager_port))
+        response, _ = sock.recvfrom(1024)
+        print(f"Registration response: {response.decode('utf-8')}")
+        sock.close()
+
     def send_command(self, command):
-        """Send command to manager"""
+        """Send command to manager, print and return the response text"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(command.encode('utf-8'), (self.manager_ip, self.manager_port))
-
         response, _ = sock.recvfrom(1024)
         resp_text = response.decode('utf-8')
         print(f"Response: {resp_text}")
         sock.close()
-        return resp_text  # <— return so caller can act on SUCCESS/FAILURE
+        return resp_text
 
+    # ---------- REPL ----------
     def run(self):
         """Interactive command loop"""
-        print("Available commands: configure-dss, deregister-user <user-name>, quit")
+        print("Available commands: configure-dss <name> <n> <striping-unit>, deregister-user [name], quit")
 
         while True:
             try:
                 cmd = input(f"{self.username}> ").strip()
 
                 if cmd == "quit":
-                    # Deregister before quitting
+                    # Best-effort deregister self before quitting
                     resp = self.send_command(f"deregister-user|{self.username}")
-                    # Terminate on SUCCESS, otherwise just break as we're quitting anyway
                     if "SUCCESS" in resp:
                         self.close()
                         sys.exit(0)
                     break
 
                 elif cmd.startswith("configure-dss"):
-                    self.send_command(cmd.replace(" ", "|"))
+                    parts = cmd.split()
+                    if len(parts) != 4:
+                        print("Usage: configure-dss <dss-name> <n>=#disks(>=3) <striping-unit>=power-of-two bytes")
+                        continue
+
+                    _, dss_name, n_str, su_str = parts
+
+                    # client-side validation to avoid 'Invalid parameters'
+                    try:
+                        n = int(n_str)
+                        su = int(su_str)
+                    except ValueError:
+                        print("Error: <n> and <striping-unit> must be integers.")
+                        continue
+
+                    if not self._valid_name(dss_name):
+                        print("Error: <dss-name> must be alphabetic and ≤ 15 chars.")
+                        continue
+                    if n < 3:
+                        print("Error: <n> must be ≥ 3.")
+                        continue
+                    if not self._is_power_of_two(su):
+                        print("Error: <striping-unit> must be a power of two (e.g., 512, 1024, 2048, 4096...).")
+                        continue
+
+                    # Send exactly what the manager expects
+                    self.send_command(f"configure-dss|{dss_name}|{n}|{su}")
 
                 elif cmd.startswith("deregister-user"):
-                    # Accept both "deregister-user" (no arg -> current user) and "deregister-user <name>"
+                    # Accept both "deregister-user" and "deregister-user <name>"
                     parts = cmd.split()
                     target = parts[1] if len(parts) > 1 else self.username
                     resp = self.send_command(f"deregister-user|{target}")
-                    # If this user was deregistered successfully, terminate the process
                     if target == self.username and "SUCCESS" in resp:
                         self.close()
                         sys.exit(0)
@@ -94,7 +126,7 @@ class DSSUser:
             except KeyboardInterrupt:
                 # Try to deregister on Ctrl+C for the current user, then exit
                 try:
-                    resp = self.send_command(f"deregister-user|{self.username}")
+                    self.send_command(f"deregister-user|{self.username}")
                 except Exception:
                     pass
                 self.close()
