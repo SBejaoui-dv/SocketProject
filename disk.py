@@ -85,6 +85,10 @@ class DSSDisk:
                     print(f"Deregistration response: {response.decode('utf-8')}")
                     sock.close()
                     break
+                elif cmd.startswith("deregister-disk"):
+                    print("working")
+
+
         except KeyboardInterrupt:
             pass
 
