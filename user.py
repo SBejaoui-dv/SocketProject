@@ -3,8 +3,9 @@
 import socket
 import sys
 import threading
-
-
+import os
+import subprocess
+import random
 class DSSUser:
     def __init__(self, username, manager_ip, manager_port, m_port, c_port):
         self.username = username
@@ -19,50 +20,50 @@ class DSSUser:
 
         self.c_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.c_socket.bind(('', c_port))
-
-        print(f"User {username} started on ports {m_port}, {c_port}")
-
-        # Registering with the manager
+        
+        # Make c_socket non-blocking for receiving blocks
+        self.c_socket.setblocking(False)
+        
+        print(f"[USER {username}] Started on ports {m_port}, {c_port}")
+        
+        # Start listener thread for peer-to-peer messages
+        self.start_listeners()
+        
+       # Registering with the manager
         self.register()
-
-    # ---------- helpers ----------
-    @staticmethod
-    def _is_power_of_two(x: int) -> bool:
-        return x > 0 and (x & (x - 1)) == 0
-
-    @staticmethod
-    def _valid_name(s: str) -> bool:
-        return s.isalpha() and len(s) <= 15
-
-    def close(self):
-        """Close sockets gracefully"""
-        try:
-            self.m_socket.close()
-        except Exception:
-            pass
-        try:
-            self.c_socket.close()
-        except Exception:
-            pass
-
-    # ---------- network ops ----------
-    def register(self):
+    
+    def start_listeners(self):
+        """Start listener thread for P2P messages on c_port"""
+        c_thread = threading.Thread(target=self.listen_c_port, daemon=True)
+        c_thread.start()
+    
+    def listen_c_port(self):
+        """Listen for peer messages (blocks during read/copy)"""
+        while True:
+            try:
+                data, addr = self.c_socket.recvfrom(65536)
+                message = data.decode('utf-8', errors='ignore')
+                print(f"[USER {self.username}] C-port received: {message[:50]}...")
+            except:
+                # Non-blocking socket will raise exception when no data
+                pass
+    
+     def register(self):
         """Register with the manager"""
         message = f"register-user|{self.username}|127.0.0.1|{self.m_port}|{self.c_port}"
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(message.encode('utf-8'), (self.manager_ip, self.manager_port))
         response, _ = sock.recvfrom(1024)
-        print(f"Registration response: {response.decode('utf-8')}")
+        print(f"[USER {self.username}] Registration: {response.decode('utf-8')}")
         sock.close()
-
-    def send_command(self, command):
-        """Send command to manager, print and return the response text"""
+    
+    def send_to_manager(self, command):
+        """Send command to manager and receive response"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(command.encode('utf-8'), (self.manager_ip, self.manager_port))
-        response, _ = sock.recvfrom(1024)
-        resp_text = response.decode('utf-8')
-        print(f"Response: {resp_text}")
-        sock.close()
+        
+        response, _ = sock.recvfrom(4096)
+         sock.close()
         return resp_text
 
     # ---------- REPL ----------
