@@ -4,7 +4,6 @@ import socket
 import sys
 import threading
 
-
 class DSSDisk:
     def __init__(self, diskname, manager_ip, manager_port, m_port, c_port):
         self.diskname = diskname
@@ -13,6 +12,9 @@ class DSSDisk:
         self.m_port = m_port
         self.c_port = c_port
 
+        # Storage: {dss_name: {file_name: {stripe: {block_idx: block_data}}}}
+        self.storage = {}
+
         # Create sockets
         self.m_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.m_socket.bind(('', m_port))
@@ -20,7 +22,7 @@ class DSSDisk:
         self.c_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.c_socket.bind(('', c_port))
 
-        print(f"Disk {diskname} started on ports {m_port}, {c_port}")
+        print(f"[DISK {diskname}] Started on ports {m_port}, {c_port}")
 
         # Register with manager
         self.register()
@@ -57,7 +59,7 @@ class DSSDisk:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(message.encode('utf-8'), (self.manager_ip, self.manager_port))
         response, _ = sock.recvfrom(1024)
-        print(f"Registration response: {response.decode('utf-8')}")
+        print(f"[DISK {self.diskname}] Registration: {response.decode('utf-8')}")
         sock.close()
 
     # ---------- listeners ----------
@@ -74,13 +76,13 @@ class DSSDisk:
             try:
                 data, addr = self.m_socket.recvfrom(1024)
                 message = data.decode('utf-8')
-                print(f"M-port received: {message}")
+                print(f"[DISK {self.diskname}] M-port: {message}")
             except Exception as e:
-                print(f"M-port error: {e}")
-                break  # exit loop if socket closed
+                print(f"[DISK {self.diskname}] M-port error: {e}")
+                break
 
     def listen_c_port(self):
-        """Listen for command messages."""
+        """Listen for command messages (block transfers, etc.)"""
         while True:
             try:
                 data, addr = self.c_socket.recvfrom(1024)
@@ -95,7 +97,7 @@ class DSSDisk:
         """Interactive command loop for the disk process."""
         try:
             while True:
-                cmd = input("Available commands: deregister-disk [name], quit\n> ").strip()
+                cmd = input(f"\n[{self.diskname}]> ").strip()
 
                 # Quit gracefully (deregister first)
                 if cmd == "quit":
@@ -115,7 +117,7 @@ class DSSDisk:
                         sys.exit(0)
 
                 else:
-                    print("Unknown command. Try 'deregister-disk' or 'quit'.")
+                    print("Commands: deregister-disk, quit")
 
         except KeyboardInterrupt:
             # Best-effort deregister on Ctrl+C
