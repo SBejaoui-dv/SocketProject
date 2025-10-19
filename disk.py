@@ -30,7 +30,6 @@ class DSSDisk:
         # Start listener threads
         self.start_listeners()
 
-    # ---------- helpers ----------
     def close(self):
         """Close sockets gracefully."""
         try:
@@ -49,10 +48,8 @@ class DSSDisk:
         response, _ = sock.recvfrom(1024)
         sock.close()
         resp_text = response.decode('utf-8')
-        print(f"Response: {resp_text}")
         return resp_text
 
-    # ---------- registration ----------
     def register(self):
         """Register with the manager."""
         message = f"register-disk|{self.diskname}|127.0.0.1|{self.m_port}|{self.c_port}"
@@ -62,7 +59,6 @@ class DSSDisk:
         print(f"[DISK {self.diskname}] Registration: {response.decode('utf-8')}")
         sock.close()
 
-    # ---------- listeners ----------
     def start_listeners(self):
         """Start listener threads for both ports."""
         m_thread = threading.Thread(target=self.listen_m_port, daemon=True)
@@ -85,27 +81,116 @@ class DSSDisk:
         """Listen for command messages (block transfers, etc.)"""
         while True:
             try:
-                data, addr = self.c_socket.recvfrom(1024)
-                message = data.decode('utf-8')
-                print(f"C-port received: {message}")
+                data, addr = self.c_socket.recvfrom(65536)
+                
+                # Parse message header to determine type
+                try:
+                    header_end = data.index(b'|', data.index(b'|', data.index(b'|') + 1) + 1)
+                    header_end = data.index(b'|', header_end + 1)
+                    header_end = data.index(b'|', header_end + 1)
+                    header_end = data.index(b'|', header_end + 1)
+                    header_end = data.index(b'|', header_end + 1)
+                except:
+                    header_end = len(data)
+                
+                header = data[:header_end].decode('utf-8', errors='ignore')
+                body = data[header_end + 1:]
+                
+                parts = header.split('|')
+                msg_type = parts[0]
+                
+                if msg_type == "WRITE_BLOCK":
+                    # Format: WRITE_BLOCK|dss_name|file_name|stripe|block_idx|block_type
+                    dss_name, file_name, stripe, block_idx, block_type = parts[1:6]
+                    self.handle_write_block(dss_name, file_name, stripe, block_idx, 
+                                           block_type, body, addr)
+                
+                elif msg_type == "READ_BLOCK":
+                    # Format: READ_BLOCK|dss_name|file_name|stripe|block_idx
+                    dss_name, file_name, stripe, block_idx = parts[1:5]
+                    self.handle_read_block(dss_name, file_name, stripe, block_idx, addr)
+                
+                elif msg_type == "FAIL":
+                    # Format: FAIL|dss_name
+                    dss_name = parts[1]
+                    self.handle_fail(dss_name, addr)
+                
+                elif msg_type == "RECOVER":
+                    # Format: RECOVER|dss_name|source_disk_idx
+                    dss_name, source_idx = parts[1:3]
+                    self.handle_recover(dss_name, source_idx, addr)
+                
             except Exception as e:
-                print(f"C-port error: {e}")
-                break  # exit loop if socket closed
+                print(f"[DISK {self.diskname}] C-port error: {e}")
+                break
 
-    # ---------- REPL ----------
+    def handle_write_block(self, dss_name, file_name, stripe, block_idx, 
+                          block_type, block_data, addr):
+        """Store a block from user."""
+        stripe = int(stripe)
+        block_idx = int(block_idx)
+        
+        # Initialize storage structure if needed
+        if dss_name not in self.storage:
+            self.storage[dss_name] = {}
+        if file_name not in self.storage[dss_name]:
+            self.storage[dss_name][file_name] = {}
+        if stripe not in self.storage[dss_name][file_name]:
+            self.storage[dss_name][file_name][stripe] = {}
+        
+        # Store the block
+        self.storage[dss_name][file_name][stripe][block_idx] = block_data
+        
+        print(f"[DISK {self.diskname}] Stored {dss_name}/{file_name}/stripe{stripe}/block{block_idx}")
+        
+        # Send ACK back to user
+        ack = f"WRITE_ACK|{dss_name}|{file_name}|{stripe}|{block_idx}"
+        self.c_socket.sendto(ack.encode('utf-8'), addr)
+
+    def handle_read_block(self, dss_name, file_name, stripe, block_idx, addr):
+        """Retrieve a block for user."""
+        stripe = int(stripe)
+        block_idx = int(block_idx)
+        
+        block_data = b""
+        if (dss_name in self.storage and 
+            file_name in self.storage[dss_name] and
+            stripe in self.storage[dss_name][file_name] and
+            block_idx in self.storage[dss_name][file_name][stripe]):
+            block_data = self.storage[dss_name][file_name][stripe][block_idx]
+        
+        print(f"[DISK {self.diskname}] Read {dss_name}/{file_name}/stripe{stripe}/block{block_idx}")
+        
+        # Send block back
+        self.c_socket.sendto(block_data, addr)
+
+    def handle_fail(self, dss_name, addr):
+        """Simulate disk failure by clearing data for this DSS."""
+        if dss_name in self.storage:
+            del self.storage[dss_name]
+        
+        print(f"[DISK {self.diskname}] Failed DSS {dss_name} - data cleared")
+        
+        # Send complete message back
+        fail_complete = f"FAIL_COMPLETE|{dss_name}"
+        self.c_socket.sendto(fail_complete.encode('utf-8'), addr)
+
+    def handle_recover(self, dss_name, source_idx, addr):
+        """Handle recovery request (simplified)."""
+        print(f"[DISK {self.diskname}] Recovery message received (stub)")
+        # Full implementation would read from source disk, XOR, and store
+
     def run(self):
         """Interactive command loop for the disk process."""
         try:
             while True:
                 cmd = input(f"\n[{self.diskname}]> ").strip()
 
-                # Quit gracefully (deregister first)
                 if cmd == "quit":
                     resp = self.send_command(f"deregister-disk|{self.diskname}")
                     if "SUCCESS" in resp:
                         self.close()
                         sys.exit(0)
-                    break
 
                 # Deregister disk (with or without explicit name)
                 elif cmd.startswith("deregister-disk"):
