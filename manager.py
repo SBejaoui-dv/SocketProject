@@ -1,198 +1,228 @@
 # manager.py
-# Minimal UDP manager for DSS milestone demo
+# Rishith Cheduluri (1225443687) and Sebastian Bejaoui (122)
 import socket
 import sys
+# For DSS
 import threading
+import json
+import random
+from collections import defaultdict
 
 class DSSManager:
-    def __init__(self, listen_port):
-        self.listen_port = listen_port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(('', listen_port))
+    def __init__(self, port):
+        self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('', port))
+        
+        # Adding state storage
+        self.users = {}  # of the format {username: {ip, m_port, c_port}}
+        self.disks = {}  # of the format {diskname: {ip, m_port, c_port, status}}
+        self.dsss = {}   # of the format {dss_name: {disks, striping_unit, files}}
+        
+        self.lock = threading.Lock()
+        self.critical_section = None  # Tracking which DSS is in critical operation
+        self.read_operations = defaultdict(set)  # of the format {dss_name: {users reading}}
+        self.pending_copy = {}  # of the format {user_name: {dss_name, file_name, file_size, owner}}
+        self.pending_failure = {}  # of the format {user_name: dss_name}
 
-        # Registries
-        # users[name] = {"ip": str, "m_port": int, "c_port": int}
-        self.users = {}
-        # disks[name] = {"ip": str, "m_port": int, "c_port": int, "state": "Available" or "InDSS:<dssname>"}
-        self.disks = {}
-        # dss[dssname] = {"n": int, "striping_unit": int, "disks": [names]}
-        self.dss = {}
+        print(f"Manager started on port {port}")
 
-        self._running = True
-        print(f"[manager] listening on UDP :{listen_port}")
-
-    # ---------- helpers ----------
-    @staticmethod
-    def _is_pow2(x: int) -> bool:
-        return x > 0 and (x & (x - 1)) == 0
-
-    @staticmethod
-    def _valid_name(s: str) -> bool:
-        return s.isalpha() and len(s) <= 15
-
-    def _send(self, text: str, addr):
-        # Always send bytes back to the sender
-        self.sock.sendto(text.encode('utf-8'), addr)
-
-    def _log(self, *args):
-        print(*args, flush=True)
-
-    # ---------- command handlers ----------
-    def handle_register_user(self, parts, addr):
-        # register-user|name|ip|m_port|c_port
-        if len(parts) != 5:
-            self._send("FAILURE|invalid-arity", addr); return
-        name, ip, m_str, c_str = parts[1], parts[2], parts[3], parts[4]
-        try:
-            m_port, c_port = int(m_str), int(c_str)
-        except ValueError:
-            self._send("FAILURE|non-integer-port", addr); return
-        if name in self.users:
-            self._send("FAILURE|user-exists", addr); return
-        self.users[name] = {"ip": ip, "m_port": m_port, "c_port": c_port}
-        self._log(f"[manager] user registered: {name} @ {ip} m:{m_port} c:{c_port}")
-        self._send("SUCCESS", addr)
-
-    def handle_register_disk(self, parts, addr):
-        # register-disk|name|ip|m_port|c_port
-        if len(parts) != 5:
-            self._send("FAILURE|invalid-arity", addr); return
-        name, ip, m_str, c_str = parts[1], parts[2], parts[3], parts[4]
-        try:
-            m_port, c_port = int(m_str), int(c_str)
-        except ValueError:
-            self._send("FAILURE|non-integer-port", addr); return
-        if name in self.disks:
-            self._send("FAILURE|disk-exists", addr); return
-        self.disks[name] = {"ip": ip, "m_port": m_port, "c_port": c_port, "state": "Available"}
-        self._log(f"[manager] disk registered: {name} @ {ip} m:{m_port} c:{c_port} state=Available")
-        self._send("SUCCESS", addr)
-
-    def handle_deregister_user(self, parts, addr):
-        # deregister-user|name
-        if len(parts) != 2:
-            self._send("FAILURE|invalid-arity", addr); return
-        name = parts[1]
-        if name not in self.users:
-            self._send("FAILURE|no-such-user", addr); return
-        del self.users[name]
-        self._log(f"[manager] user deregistered: {name}")
-        self._send("SUCCESS", addr)
-
-    def handle_deregister_disk(self, parts, addr):
-        # deregister-disk|name   (FAILURE if not exist OR state InDSS)
-        if len(parts) != 2:
-            self._send("FAILURE|invalid-arity", addr); return
-        name = parts[1]
-        if name not in self.disks:
-            self._send("FAILURE|no-such-disk", addr); return
-        state = self.disks[name]["state"]
-        if isinstance(state, str) and state.startswith("InDSS"):
-            self._send("FAILURE|disk-in-dss", addr); return
-        del self.disks[name]
-        self._log(f"[manager] disk deregistered: {name}")
-        self._send("SUCCESS", addr)
-
-    def handle_configure_dss(self, parts, addr):
-        # configure-dss|<dss-name>|<n>|<striping-unit>  (sent by a USER)
-        if len(parts) != 4:
-            self._send("FAILURE|invalid-arity", addr); return
-        dss_name, n_str, su_str = parts[1], parts[2], parts[3]
-        # Validate parameters
-        if not self._valid_name(dss_name):
-            self._send("FAILURE|bad-dss-name", addr); return
-        try:
-            n = int(n_str); su = int(su_str)
-        except ValueError:
-            self._send("FAILURE|non-integer", addr); return
-        if n < 3:
-            self._send("FAILURE|n-must-be->=3", addr); return
-        if not self._is_pow2(su):
-            self._send("FAILURE|striping-unit-not-power-of-two", addr); return
-        if dss_name in self.dss:
-            self._send("FAILURE|dss-exists", addr); return
-
-        # Allocate disks
-        avail = [name for name, meta in self.disks.items() if meta["state"] == "Available"]
-        if len(avail) < n:
-            self._send("FAILURE|insufficient-disks", addr); return
-
-        chosen = avail[:n]
-        for d in chosen:
-            self.disks[d]["state"] = f"InDSS:{dss_name}"
-        self.dss[dss_name] = {"n": n, "striping_unit": su, "disks": chosen}
-
-        self._log(f"[manager] DSS configured: {dss_name} n={n} su={su} using disks {chosen}")
-        # (Optional) you could notify disks on their m_port here.
-        self._send(f"SUCCESS|configured {dss_name} with n={n}, su={su}", addr)
-
-    # ---------- server loops ----------
-    def udp_loop(self):
-        while self._running:
-            try:
-                data, addr = self.sock.recvfrom(2048)
-            except OSError:
-                break  # socket closed
-            msg = data.decode('utf-8').strip()
-            self._log(f"[manager] from {addr}: {msg}")
-            parts = msg.split('|')
-            if not parts:
-                self._send("FAILURE|empty", addr); continue
-
-            cmd = parts[0]
-            try:
-                if cmd == "register-user":
-                    self.handle_register_user(parts, addr)
-                elif cmd == "register-disk":
-                    self.handle_register_disk(parts, addr)
-                elif cmd == "deregister-user":
-                    self.handle_deregister_user(parts, addr)
-                elif cmd == "deregister-disk":
-                    self.handle_deregister_disk(parts, addr)
-                elif cmd == "configure-dss":
-                    self.handle_configure_dss(parts, addr)
-                else:
-                    self._send("FAILURE|unknown-command", addr)
-            except Exception as e:
-                # Defensive: never crash the manager on bad input
-                self._log(f"[manager] error handling '{msg}': {e}")
-                self._send("FAILURE|internal-error", addr)
-
-    def console_loop(self):
-        # Local manager console for terminate-manager and simple introspection
-        while self._running:
-            try:
-                line = input().strip()
-            except EOFError:
-                break
-            if line == "terminate-manager":
-                self._log("[manager] terminating...")
-                self._running = False
-                break
-            elif line == "show-state":
-                self._log(f"[state] users={list(self.users.keys())}")
-                self._log(f"[state] disks={{name:meta['state'] for name,meta in self.disks.items()}}")
-                self._log(f"[state] dss={self.dss}")
-            else:
-                self._log("[manager] console commands: terminate-manager | show-state")
-
+        listener = threading.Thread(target=self.run)
+        listener.daemon = True
+        listener.start()
+    
     def run(self):
-        t = threading.Thread(target=self.udp_loop, daemon=True)
-        t.start()
-        self.console_loop()
-        # Shutdown
+        """Main server loop"""
+        while True:
+            try:
+                data, addr = self.socket.recvfrom(2048)
+                message = data.decode('utf-8')
+                print(f"[MANAGER] Received: {message} from {addr}")
+                
+                response = self.process_message(message, addr)
+                self.socket.sendto(response.encode('utf-8'), addr)
+                
+            except Exception as e:
+                print(f"[MANAGER ERROR] {e}")
+    
+    def process_message(self, message, addr):
+        """Process incoming messages and enforce critical sections"""
         try:
-            self.sock.close()
-        except Exception:
-            pass
-        t.join(timeout=0.5)
-        self._log("[manager] stopped.")
+            parts = message.split('|')
+            command = parts[0]
+            
+            critical_commands = ['copy', 'disk-failure', 'decommission-dss']
+            
+            # Checking if we're in criticla section for wrong DSS
+            if command in critical_commands and len(parts) > 1:
+                dss_name = parts[1]
+                with self.lock:
+                    if self.critical_section and self.critical_section != dss_name:
+                        return "FAILURE|DSS in critical operation"
+            
+            if command == "register-user":
+                return self.register_user(parts[1:])
+            elif command == "register-disk":
+                return self.register_disk(parts[1:])
+            elif command == "deregister-user":
+                return self.deregister_user(parts[1:])
+            elif command == "deregister-disk":
+                return self.deregister_disk(parts[1:])
+            elif command == "configure-dss":
+                return self.configure_dss(parts[1:])
+            elif command == "ls":
+                return self.handle_ls()
+            elif command == "copy":
+                return self.handle_copy_phase1(parts[1:])
+            elif command == "copy-complete":
+                return self.handle_copy_phase2(parts[1:])
+            elif command == "read":
+                return self.handle_read_phase1(parts[1:])
+            elif command == "read-complete":
+                return self.handle_read_complete(parts[1:])
+            elif command == "disk-failure":
+                return self.handle_disk_failure_phase1(parts[1:])
+            elif command == "recovery-complete":
+                return self.handle_recovery_complete(parts[1:])
+            elif command == "decommission-dss":
+                return self.handle_decommission_phase1(parts[1:])
+            elif command == "decommission-complete":
+                return self.handle_decommission_phase2(parts[1:])
+            else:
+                return "FAILURE|Unknown command"
+        except Exception as e:
+            return f"FAILURE|Error processing message: {str(e)}"
+    
+    def register_user(self, params):
+        """Handle register-user command"""
+        if len(params) != 4:
+            return "FAILURE|Invalid parameters"
+        
+        username, ip, m_port, c_port = params
+        
+        # Checking if the user already exists
+        if username in self.users:
+            return "FAILURE|User already registered"
+        
+        
+        # Storing the user info
+        self.users[username] = {
+            'ip': ip,
+            'm_port': int(m_port),
+            'c_port': int(c_port)
+        }
+        
+        print(f"[MANAGER] User {username} registered")
+        return "SUCCESS"
+    
+    def register_disk(self, params):
+        """Handle register-disk command"""
+        if len(params) != 4:
+            return "FAILURE|Invalid parameters"
+        
+        diskname, ip, m_port, c_port = params
+        
+        # Checking ifthe disk already exists
+        if diskname in self.disks:
+            return "FAILURE|Disk already registered"
+        
+        # Storing the disk info
+        self.disks[diskname] = {
+            'ip': ip,
+            'm_port': int(m_port),
+            'c_port': int(c_port),
+            'status': 'Free'
+        }
+        
+        print(f"[MANAGER] Disk {diskname} registered")
+        return "SUCCESS"
+    
+    def configure_dss(self, params):
+        """Handle configure-dss command"""
+        if len(params) != 3:
+            return "FAILURE|Invalid parameters"
+        
+        dss_name, n, striping_unit = params
+        n = int(n)
+        striping_unit = int(striping_unit)
+        
+        # Validating
+        if n < 3:
+            return "FAILURE|n must be >= 3"
+        
+        if dss_name in self.dsss:
+            return "FAILURE|DSS already exists"
+        
+        # Checking if theres enough free disks
+        free_disks = [name for name, info in self.disks.items() if info['status'] == 'Free']
+        if len(free_disks) < n:
+            return "FAILURE|Not enough free disks"
+        
+        # Checking if the striping unit is power of 2 and in range
+        if not (128 <= striping_unit <= 1048576 and (striping_unit & (striping_unit - 1)) == 0):
+            return "FAILURE|Invalid striping unit"
+        
+        # Selecting 'n' disks randomly
+        import random
+        selected_disks = random.sample(free_disks, n)
+        
+        # Updating disk status
+        with self.lock:
+            for disk_name in selected_disks:
+                self.disks[disk_name]['status'] = 'InDSS'
 
+            self.dsss[dss_name] = {
+                'disks': selected_disks,
+                'n': n,
+                'striping_unit': striping_unit,
+                'files': {}
+            }
+        
+        # Creating the DSS
+        self.dsss[dss_name] = {
+            'disks': selected_disks,
+            'n': n,
+            'striping_unit': striping_unit,
+            'files': {}
+        }
+        
+        print(f"DSS {dss_name} configured with disks: {selected_disks}")
+        return "SUCCESS"
+    
+    def deregister_user(self, params):
+        """Handle deregister-user command"""
+        if len(params) != 1:
+            return "FAILURE|Invalid parameters"
+        
+        username = params[0]
+        if username not in self.users:
+            return "FAILURE|User not found"
+        
+        del self.users[username]
+        print(f"User {username} deregistered")
+        return "SUCCESS"
+    
+    def deregister_disk(self, params):
+        """Handle deregister-disk command"""
+        if len(params) != 1:
+            return "FAILURE|Invalid parameters"
+        
+        diskname = params[0]
+        if diskname not in self.disks:
+            return "FAILURE|Disk not found"
+        
+        if self.disks[diskname]['status'] == 'InDSS':
+            return "FAILURE|Disk is in use"
+        
+        del self.disks[diskname]
+        print(f"Disk {diskname} deregistered")
+        return "SUCCESS"
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python3 manager.py <listen_port>")
+        print("Usage: python manager.py <port>")
         sys.exit(1)
+    
     port = int(sys.argv[1])
-    mgr = DSSManager(port)
-    mgr.run()
+    manager = DSSManager(port)
+    manager.run()
