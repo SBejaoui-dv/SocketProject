@@ -6,6 +6,7 @@ import threading
 import os
 import subprocess
 import random
+
 class DSSUser:
     def __init__(self, username, manager_ip, manager_port, m_port, c_port):
         self.username = username
@@ -63,97 +64,450 @@ class DSSUser:
         sock.sendto(command.encode('utf-8'), (self.manager_ip, self.manager_port))
         
         response, _ = sock.recvfrom(4096)
-         sock.close()
-        return resp_text
-
-    # ---------- REPL ----------
-    def run(self):
+        sock.close()
+        return response.decode('utf-8')
+    
+    def send_to_peer(self, peer_ip, peer_port, message):
+        """Send message to a peer (disk process)"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(message.encode('utf-8'), (peer_ip, peer_port))
+        sock.close()
+    
+    def handle_ls(self):
+        """Handle ls command"""
+        response = self.send_to_manager("ls")
+        print(f"\n[USER {self.username}] File Listing:")
+        if response.startswith("SUCCESS"):
+            parts = response.split('|')
+            i = 1
+            while i < len(parts):
+                if parts[i].startswith("DSS:"):
+                    dss_name = parts[i].replace("DSS:", "")
+                    print(f"\n{dss_name}:")
+                    i += 1
+                    while i < len(parts) and not parts[i].startswith("DSS:"):
+                        if parts[i].startswith("FILE:"):
+                            file_name = parts[i].replace("FILE:", "")
+                            size = parts[i+1].split('=')[1]
+                            owner = parts[i+2].split('=')[1]
+                            print(f"  {file_name} ({size} bytes) - Owner: {owner}")
+                            i += 3
+                        else:
+                            print(f"  {parts[i]}")
+                            i += 1
+                else:
+                    i += 1
+        else:
+            print(f"Error: {response}")
+    
+    def handle_configure_dss(self, dss_name, n, striping_unit):
+        """Handle configure-dss command"""
+        command = f"configure-dss|{dss_name}|{n}|{striping_unit}"
+        response = self.send_to_manager(command)
+        print(f"[USER {self.username}] Configure DSS: {response}")
+    
+    def handle_copy(self, file_path):
+        """Handle copy command - two phase operation"""
+        if not os.path.exists(file_path):
+            print(f"[USER {self.username}] File not found: {file_path}")
+            return
+        
+        file_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        # Phase 1: Get DSS parameters
+        command = f"copy|{file_name}|{file_size}|{self.username}"
+        response = self.send_to_manager(command)
+        
+        if response.startswith("FAILURE"):
+            print(f"[USER {self.username}] Copy failed: {response}")
+            return
+        
+        # Parse DSS parameters
+        parts = response.split('|')
+        dss_name = parts[1]
+        n = int(parts[2])
+        striping_unit = int(parts[3])
+        
+        # Extract disk triples
+        disk_triples = []
+        for i in range(n):
+            idx = 4 + i * 3
+            disk_name = parts[idx]
+            disk_ip = parts[idx + 1]
+            disk_port = int(parts[idx + 2])
+            disk_triples.append((disk_name, disk_ip, disk_port))
+        
+        print(f"[USER {self.username}] Copy phase 1: {file_name} -> {dss_name}")
+        
+        # Phase 2: Actually copy file
+        self.copy_file_to_dss(file_path, dss_name, n, striping_unit, disk_triples)
+        
+        # Phase 3: Notify manager copy is complete
+        complete_cmd = f"copy-complete|{self.username}"
+        response = self.send_to_manager(complete_cmd)
+        print(f"[USER {self.username}] Copy phase 2: {response}")
+    
+    def copy_file_to_dss(self, file_path, dss_name, n, striping_unit, disk_triples):
+        """Read file and stripe it across disks with parity"""
+        print(f"[USER {self.username}] Striping {file_path} across {n} disks...")
+        
+        with open(file_path, 'rb') as f:
+            stripe_num = 0
+            while True:
+                # Read n-1 data blocks
+                data_blocks = []
+                for i in range(n - 1):
+                    block = f.read(striping_unit)
+                    if not block and i == 0:
+                        return  # EOF
+                    if not block or len(block) < striping_unit:
+                        # Pad with zeros
+                        block = block.ljust(striping_unit, b'\x00')
+                    data_blocks.append(block)
+                
+                # Compute parity block
+                parity = self.compute_parity(data_blocks)
+                
+                # Determine which disk gets parity for this stripe
+                parity_disk_idx = n - ((stripe_num % n) + 1)
+                
+                print(f"[USER {self.username}] Stripe {stripe_num}: parity on disk {parity_disk_idx}")
+                
+                # Write blocks in parallel
+                threads = []
+                for i in range(n):
+                    if i == parity_disk_idx:
+                        block_data = parity
+                        block_type = 'parity'
+                    else:
+                        # Map data block index (skip parity disk)
+                        data_idx = i if i < parity_disk_idx else i - 1
+                        block_data = data_blocks[data_idx]
+                        block_type = 'data'
+                    
+                    disk_name, disk_ip, disk_port = disk_triples[i]
+                    t = threading.Thread(
+                        target=self.write_block_to_disk,
+                        args=(disk_name, disk_ip, disk_port, dss_name, file_path,
+                              stripe_num, i, block_data, block_type)
+                    )
+                    threads.append(t)
+                    t.start()
+                
+                # Wait for all writes
+                for t in threads:
+                    t.join()
+                
+                stripe_num += 1
+    
+    def write_block_to_disk(self, disk_name, disk_ip, disk_port, dss_name, 
+                           file_name, stripe, block_idx, block_data, block_type):
+        """Send a block to disk"""
+        try:
+            file_base = os.path.basename(file_name)
+            # Format: WRITE_BLOCK|dss_name|file_name|stripe|block_idx|block_type
+            # Block data follows as binary after delimiter
+            header = f"WRITE_BLOCK|{dss_name}|{file_base}|{stripe}|{block_idx}|{block_type}|"
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Send header + binary data
+            message = header.encode('utf-8') + block_data
+            sock.sendto(message, (disk_ip, disk_port))
+            
+            # Wait for ACK
+            sock.settimeout(2)
+            response, _ = sock.recvfrom(1024)
+            print(f"[USER {self.username}] Block {stripe}:{block_idx} written to {disk_name}")
+            sock.close()
+        except Exception as e:
+            print(f"[USER {self.username}] Error writing block to {disk_name}: {e}")
+    
+    def compute_parity(self, data_blocks):
+        """XOR all data blocks to compute parity"""
+        parity = bytearray(len(data_blocks[0]))
+        for block in data_blocks:
+            for i in range(len(block)):
+                parity[i] ^= block[i]
+        return bytes(parity)
+    
+    def handle_read(self, dss_name, file_name):
+        """Handle read command - two phase operation"""
+        # Phase 1: Request file from manager
+        command = f"read|{dss_name}|{file_name}|{self.username}"
+        response = self.send_to_manager(command)
+        
+        if response.startswith("FAILURE"):
+            print(f"[USER {self.username}] Read failed: {response}")
+            return
+        
+        # Parse response
+        parts = response.split('|')
+        n = int(parts[1])
+        striping_unit = int(parts[2])
+        file_size = int(parts[3])
+        
+        # Extract disk triples
+        disk_triples = []
+        for i in range(n):
+            idx = 4 + i * 3
+            disk_name = parts[idx]
+            disk_ip = parts[idx + 1]
+            disk_port = int(parts[idx + 2])
+            disk_triples.append((disk_name, disk_ip, disk_port))
+        
+        print(f"[USER {self.username}] Read phase 1: {file_name} from {dss_name}")
+        
+        # Phase 2: Read file from DSS
+        self.read_file_from_dss(dss_name, file_name, file_size, n, striping_unit, disk_triples)
+        
+        # Phase 3: Notify manager read is complete
+        complete_cmd = f"read-complete|{self.username}|{dss_name}"
+        response = self.send_to_manager(complete_cmd)
+        print(f"[USER {self.username}] Read complete: {response}")
+        
+        # Verify with diff
+        if os.path.exists(file_name):
+            recovered_file = f"{file_name}.recovered"
+            try:
+                result = subprocess.run(['diff', file_name, recovered_file], 
+                                      capture_output=True, text=True)
+                if result.returncode == 0:
+                    print(f"[USER {self.username}] ✓ File verification PASSED")
+                else:
+                    print(f"[USER {self.username}] ✗ File verification FAILED")
+            except Exception as e:
+                print(f"[USER {self.username}] Could not verify: {e}")
+    
+    def read_file_from_dss(self, dss_name, file_name, file_size, n, striping_unit, disk_triples):
+        """Read file from DSS with parity verification"""
+        num_stripes = (file_size + (n-1)*striping_unit - 1) // ((n-1)*striping_unit)
+        print(f"[USER {self.username}] Reading {num_stripes} stripes from DSS...")
+        
+        with open(f"{file_name}.recovered", 'wb') as out:
+            for stripe in range(num_stripes):
+                # Read all blocks of this stripe in parallel
+                blocks = [None] * n
+                threads = []
+                
+                for i in range(n):
+                    disk_name, disk_ip, disk_port = disk_triples[i]
+                    t = threading.Thread(
+                        target=self.read_block_from_disk,
+                        args=(disk_name, disk_ip, disk_port, dss_name, file_name,
+                              stripe, i, blocks)
+                    )
+                    threads.append(t)
+                    t.start()
+                
+                # Wait for all reads
+                for t in threads:
+                    t.join()
+                
+                # Introduce bit error with probability p
+                p = 10  # 10% error rate for testing
+                for i in range(n):
+                    if blocks[i] and random.randint(0, 100) < p:
+                        print(f"[USER {self.username}] Introducing error in stripe {stripe} block {i}")
+                        block_arr = bytearray(blocks[i])
+                        bit_pos = random.randint(0, len(block_arr) * 8 - 1)
+                        byte_idx = bit_pos // 8
+                        bit_idx = bit_pos % 8
+                        block_arr[byte_idx] ^= (1 << bit_idx)
+                        blocks[i] = bytes(block_arr)
+                
+                # Verify parity
+                parity_disk_idx = n - ((stripe % n) + 1)
+                data_blocks = [blocks[i] for i in range(n) if i != parity_disk_idx]
+                
+                computed_parity = self.compute_parity(data_blocks)
+                if computed_parity == blocks[parity_disk_idx]:
+                    print(f"[USER {self.username}] Stripe {stripe}: parity verified ✓")
+                    # Write data blocks to output
+                    for i in range(n):
+                        if i != parity_disk_idx:
+                            out.write(blocks[i])
+                else:
+                    print(f"[USER {self.username}] Stripe {stripe}: parity mismatch! Retrying...")
+                    # Retry: read again
+                    stripe -= 1  # Retry this stripe
+    
+    def read_block_from_disk(self, disk_name, disk_ip, disk_port, dss_name, 
+                            file_name, stripe, block_idx, blocks_array):
+        """Read a block from disk"""
+        try:
+            file_base = os.path.basename(file_name)
+            msg = f"READ_BLOCK|{dss_name}|{file_base}|{stripe}|{block_idx}"
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(msg.encode('utf-8'), (disk_ip, disk_port))
+            
+            sock.settimeout(2)
+            data, _ = sock.recvfrom(65536)
+            blocks_array[block_idx] = data
+            sock.close()
+        except Exception as e:
+            print(f"[USER {self.username}] Error reading from {disk_name}: {e}")
+    
+    def handle_disk_failure(self, dss_name):
+        """Handle disk-failure command - two phase operation"""
+        # Phase 1: Get DSS parameters
+        command = f"disk-failure|{dss_name}"
+        response = self.send_to_manager(command)
+        
+        if response.startswith("FAILURE"):
+            print(f"[USER {self.username}] Disk failure failed: {response}")
+            return
+        
+        # Parse response
+        parts = response.split('|')
+        n = int(parts[1])
+        striping_unit = int(parts[2])
+        
+        # Extract disk triples
+        disk_triples = []
+        for i in range(n):
+            idx = 3 + i * 3
+            disk_name = parts[idx]
+            disk_ip = parts[idx + 1]
+            disk_port = int(parts[idx + 2])
+            disk_triples.append((disk_name, disk_ip, disk_port))
+        
+        print(f"[USER {self.username}] Disk failure phase 1: {dss_name}")
+        
+        # Phase 2: Simulate failure and recover
+        self.simulate_failure_and_recover(dss_name, n, striping_unit, disk_triples)
+        
+        # Phase 3: Notify manager recovery complete
+        complete_cmd = f"recovery-complete|{dss_name}"
+        response = self.send_to_manager(complete_cmd)
+        print(f"[USER {self.username}] Recovery complete: {response}")
+    
+    def simulate_failure_and_recover(self, dss_name, n, striping_unit, disk_triples):
+        """Simulate disk failure and recovery"""
+        # Randomly select failed disk
+        failed_disk_idx = random.randint(0, n - 1)
+        failed_disk = disk_triples[failed_disk_idx]
+        
+        print(f"[USER {self.username}] Failing disk {failed_disk_idx}: {failed_disk[0]}")
+        
+        # Send fail message to failed disk
+        fail_msg = f"FAIL|{dss_name}"
+        self.send_to_peer(failed_disk[1], failed_disk[2], fail_msg)
+        
+        print(f"[USER {self.username}] Recovering data to disk {failed_disk_idx}...")
+        
+        # For each file, recover each stripe
+        # This is simplified - in real impl would need to know which files exist
+        # For now, just recover the structure
+        for i in range(n):
+            if i != failed_disk_idx:
+                # Send recover command
+                recover_msg = f"RECOVER|{dss_name}|{i}"
+                disk = disk_triples[i]
+                self.send_to_peer(disk[1], disk[2], recover_msg)
+    
+    def handle_decommission_dss(self, dss_name):
+        """Handle decommission-dss command - two phase operation"""
+        # Phase 1: Get DSS parameters
+        command = f"decommission-dss|{dss_name}"
+        response = self.send_to_manager(command)
+        
+        if response.startswith("FAILURE"):
+            print(f"[USER {self.username}] Decommission failed: {response}")
+            return
+        
+        # Parse response
+        parts = response.split('|')
+        n = int(parts[1])
+        
+        # Extract disk triples
+        disk_triples = []
+        for i in range(n):
+            idx = 2 + i * 3
+            disk_name = parts[idx]
+            disk_ip = parts[idx + 1]
+            disk_port = int(parts[idx + 2])
+            disk_triples.append((disk_name, disk_ip, disk_port))
+        
+        print(f"[USER {self.username}] Decommission phase 1: {dss_name}")
+        
+        # Phase 2: Send fail to all disks to clear data
+        for disk_name, disk_ip, disk_port in disk_triples:
+            fail_msg = f"FAIL|{dss_name}"
+            self.send_to_peer(disk_ip, disk_port, fail_msg)
+        
+        # Phase 3: Notify manager decommission is complete
+        complete_cmd = f"decommission-complete|{dss_name}"
+        response = self.send_to_manager(complete_cmd)
+        print(f"[USER {self.username}] Decommission complete: {response}")
+    
+   def run(self):
         """Interactive command loop"""
-        print("Available commands: configure-dss <name> <n> <striping-unit>, deregister-user [name], quit")
-
-        while True:
+        print(f"\n[USER {self.username}] Available commands:")
+        print("  configure-dss <name> <n> <striping_unit>")
+        print("  copy <file_path>")
+        print("  read <dss_name> <file_name>")
+        print("  ls")
+        print("  disk-failure <dss_name>")
+        print("  decommission-dss <dss_name>")
+        print("  deregister-user")
+        print("  quit\n")
+        
+       while True:
             try:
                 cmd = input(f"{self.username}> ").strip()
-                # Normalize any pasted Unicode dashes into ASCII '-'
-                cmd = (cmd.replace('\u2010', '-')
-                       .replace('\u2011', '-')
-                       .replace('\u2012', '-')
-                       .replace('\u2013', '-')
-                       .replace('\u2014', '-')
-                       .replace('\u2212', '-'))
-
+                
+                if not cmd:
+                    continue
+                
                 if cmd == "quit":
-                    # Best-effort deregister self before quitting
-                    resp = self.send_command(f"deregister-user|{self.username}")
-                    if "SUCCESS" in resp:
-                        self.close()
-                        sys.exit(0)
-                    break  # even if failure, leave loop
-
-                elif cmd.startswith("configure-dss"):
+                    self.send_to_manager(f"deregister-user|{self.username}")
+                    break
+                elif cmd == "ls":
+                    self.handle_ls()
+                elif cmd.startswith("configure-dss "):
                     parts = cmd.split()
-                    if len(parts) != 4:
-                        print("Usage: configure-dss <dss-name> <n>=#disks(>=3) <striping-unit>=power-of-two bytes")
-                        continue
-
-                    _, dss_name, n_str, su_str = parts
-
-                    # client-side validation to avoid 'Invalid parameters'
-                    try:
-                        n = int(n_str)
-                        su = int(su_str)
-                    except ValueError:
-                        print("Error: <n> and <striping-unit> must be integers.")
-                        continue
-
-                    if not self._valid_name(dss_name):
-                        print("Error: <dss-name> must be alphabetic and ≤ 15 chars.")
-                        continue
-                    if n < 3:
-                        print("Error: <n> must be ≥ 3.")
-                        continue
-                    if not self._is_power_of_two(su):
-                        print("Error: <striping-unit> must be a power of two (e.g., 512, 1024, 2048, 4096...).")
-                        continue
-
-                    # Send exactly what the manager expects
-                    self.send_command(f"configure-dss|{dss_name}|{n}|{su}")
-                    continue  # <- prevent falling through to "Unknown command"
-
-                elif cmd.startswith("deregister-user"):
-                    # Accept both "deregister-user" and "deregister-user <name>"
+                    if len(parts) == 4:
+                        self.handle_configure_dss(parts[1], int(parts[2]), int(parts[3]))
+                    else:
+                        print("Usage: configure-dss <name> <n> <striping_unit>")
+                elif cmd.startswith("copy "):
+                    file_path = cmd[5:].strip()
+                    self.handle_copy(file_path)
+                elif cmd.startswith("read "):
                     parts = cmd.split()
-                    target = parts[1] if len(parts) > 1 else self.username
-                    resp = self.send_command(f"deregister-user|{target}")
-                    if target == self.username and "SUCCESS" in resp:
-                        self.close()
-                        sys.exit(0)
-                    continue  # keep REPL alive if deregistering someone else
-
+                    if len(parts) == 3:
+                        self.handle_read(parts[1], parts[2])
+                    else:
+                        print("Usage: read <dss_name> <file_name>")
+                elif cmd.startswith("disk-failure "):
+                    dss_name = cmd[13:].strip()
+                    self.handle_disk_failure(dss_name)
+                elif cmd.startswith("decommission-dss "):
+                    dss_name = cmd[17:].strip()
+                    self.handle_decommission_dss(dss_name)
+                elif cmd == "deregister-user":
+                    self.send_to_manager(f"deregister-user|{self.username}")
+                    break
                 else:
                     print("Unknown command")
-                    continue
-
+                    
             except KeyboardInterrupt:
-                # Try to deregister on Ctrl+C for the current user, then exit
-                try:
-                    self.send_command(f"deregister-user|{self.username}")
-                except Exception:
-                    pass
-                self.close()
                 break
-
+        
+        print(f"[USER {self.username}] Exiting...")
 
 if __name__ == "__main__":
     if len(sys.argv) != 6:
         print("Usage: python user.py <username> <manager_ip> <manager_port> <m_port> <c_port>")
         sys.exit(1)
-
+    
     username = sys.argv[1]
     manager_ip = sys.argv[2]
     manager_port = int(sys.argv[3])
     m_port = int(sys.argv[4])
     c_port = int(sys.argv[5])
-
+    
     user = DSSUser(username, manager_ip, manager_port, m_port, c_port)
     user.run()
