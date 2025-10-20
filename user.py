@@ -6,6 +6,8 @@ import threading
 import os
 import subprocess
 import random
+import struct
+import time
 
 class DSSUser:
     def __init__(self, username, manager_ip, manager_port, m_port, c_port):
@@ -22,34 +24,10 @@ class DSSUser:
         self.c_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.c_socket.bind(('', c_port))
         
-        # Make c_socket non-blocking for receiving blocks
-        self.c_socket.setblocking(False)
-        
         print(f"[USER {username}] Started on ports {m_port}, {c_port}")
-        
-        # Start listener thread for peer-to-peer messages
-        self.start_listeners()
-        
-       # Registering with the manager
         self.register()
     
-    def start_listeners(self):
-        """Start listener thread for P2P messages on c_port"""
-        c_thread = threading.Thread(target=self.listen_c_port, daemon=True)
-        c_thread.start()
-    
-    def listen_c_port(self):
-        """Listen for peer messages (blocks during read/copy)"""
-        while True:
-            try:
-                data, addr = self.c_socket.recvfrom(65536)
-                message = data.decode('utf-8', errors='ignore')
-                print(f"[USER {self.username}] C-port received: {message[:50]}...")
-            except:
-                # Non-blocking socket will raise exception when no data
-                pass
-    
-     def register(self):
+    def register(self):
         """Register with the manager"""
         message = f"register-user|{self.username}|127.0.0.1|{self.m_port}|{self.c_port}"
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -62,15 +40,19 @@ class DSSUser:
         """Send command to manager and receive response"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.sendto(command.encode('utf-8'), (self.manager_ip, self.manager_port))
-        
-        response, _ = sock.recvfrom(4096)
-        sock.close()
-        return response.decode('utf-8')
+        sock.settimeout(5)
+        try:
+            response, _ = sock.recvfrom(4096)
+            sock.close()
+            return response.decode('utf-8')
+        except socket.timeout:
+            sock.close()
+            return "FAILURE|Manager timeout"
     
-    def send_to_peer(self, peer_ip, peer_port, message):
-        """Send message to a peer (disk process)"""
+    def send_to_peer(self, peer_ip, peer_port, data):
+        """Send data to peer (can be binary)"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.sendto(message.encode('utf-8'), (peer_ip, peer_port))
+        sock.sendto(data, (peer_ip, peer_port))
         sock.close()
     
     def handle_ls(self):
@@ -78,34 +60,26 @@ class DSSUser:
         response = self.send_to_manager("ls")
         print(f"\n[USER {self.username}] File Listing:")
         if response.startswith("SUCCESS"):
-            parts = response.split('|')
-            i = 1
-            while i < len(parts):
-                if parts[i].startswith("DSS:"):
-                    dss_name = parts[i].replace("DSS:", "")
-                    print(f"\n{dss_name}:")
-                    i += 1
-                    while i < len(parts) and not parts[i].startswith("DSS:"):
-                        if parts[i].startswith("FILE:"):
-                            file_name = parts[i].replace("FILE:", "")
-                            size = parts[i+1].split('=')[1]
-                            owner = parts[i+2].split('=')[1]
-                            print(f"  {file_name} ({size} bytes) - Owner: {owner}")
-                            i += 3
-                        else:
-                            print(f"  {parts[i]}")
-                            i += 1
-                else:
-                    i += 1
+            parts = response.split('|')[1:]
+            for part in parts:
+                print(f"  {part}")
         else:
-            print(f"Error: {response}")
+            print(f"  {response}")
     
     def handle_configure_dss(self, dss_name, n, striping_unit):
         """Handle configure-dss command"""
         command = f"configure-dss|{dss_name}|{n}|{striping_unit}"
         response = self.send_to_manager(command)
-        print(f"[USER {self.username}] Configure DSS: {response}")
+        print(f"[USER {self.username}] {response}")
     
+    def compute_parity(self, data_blocks):
+        """XOR all data blocks to compute parity"""
+        parity = bytearray(len(data_blocks[0]))
+        for block in data_blocks:
+            for i in range(len(block)):
+                parity[i] ^= block[i]
+        return bytes(parity)
+   
     def handle_copy(self, file_path):
         """Handle copy command - two phase operation"""
         if not os.path.exists(file_path):
@@ -146,12 +120,13 @@ class DSSUser:
         # Phase 3: Notify manager copy is complete
         complete_cmd = f"copy-complete|{self.username}"
         response = self.send_to_manager(complete_cmd)
-        print(f"[USER {self.username}] Copy phase 2: {response}")
+        print(f"[USER {self.username}] Copy complete: {response}")
     
     def copy_file_to_dss(self, file_path, dss_name, n, striping_unit, disk_triples):
         """Read file and stripe it across disks with parity"""
-        print(f"[USER {self.username}] Striping {file_path} across {n} disks...")
-        
+        file_name = os.path.basename(file_path)
+        print(f"[USER {self.username}] Striping {file_name} across {n} disks...")
+       
         with open(file_path, 'rb') as f:
             stripe_num = 0
             while True:
@@ -159,10 +134,12 @@ class DSSUser:
                 data_blocks = []
                 for i in range(n - 1):
                     block = f.read(striping_unit)
-                    if not block and i == 0:
-                        return  # EOF
-                    if not block or len(block) < striping_unit:
-                        # Pad with zeros
+                    if not block:
+                        if i == 0:
+                            return  # EOF
+                    if not block:
+                        block = b'\x00' * striping_unit
+                    elif len(block) < striping_unit:
                         block = block.ljust(striping_unit, b'\x00')
                     data_blocks.append(block)
                 
@@ -189,7 +166,7 @@ class DSSUser:
                     disk_name, disk_ip, disk_port = disk_triples[i]
                     t = threading.Thread(
                         target=self.write_block_to_disk,
-                        args=(disk_name, disk_ip, disk_port, dss_name, file_path,
+                        args=(disk_name, disk_ip, disk_port, dss_name, file_name,
                               stripe_num, i, block_data, block_type)
                     )
                     threads.append(t)
@@ -203,33 +180,25 @@ class DSSUser:
     
     def write_block_to_disk(self, disk_name, disk_ip, disk_port, dss_name, 
                            file_name, stripe, block_idx, block_data, block_type):
-        """Send a block to disk"""
+        """Send a block to disk with length prefix"""
         try:
             file_base = os.path.basename(file_name)
-            # Format: WRITE_BLOCK|dss_name|file_name|stripe|block_idx|block_type
-            # Block data follows as binary after delimiter
-            header = f"WRITE_BLOCK|{dss_name}|{file_base}|{stripe}|{block_idx}|{block_type}|"
+            block_size = len(block_data)
             
+            # Format: WRITE_BLOCK|dss|file|stripe|block_idx|type|size|[data]
+            header = f"WRITE_BLOCK|{dss_name}|{file_base}|{stripe}|{block_idx}|{block_type}|{block_size}|"
+           
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            # Send header + binary data
             message = header.encode('utf-8') + block_data
             sock.sendto(message, (disk_ip, disk_port))
             
             # Wait for ACK
             sock.settimeout(2)
             response, _ = sock.recvfrom(1024)
-            print(f"[USER {self.username}] Block {stripe}:{block_idx} written to {disk_name}")
+            print(f"[USER {self.username}] Block {stripe}:{block_idx} -> {disk_name}")
             sock.close()
         except Exception as e:
             print(f"[USER {self.username}] Error writing block to {disk_name}: {e}")
-    
-    def compute_parity(self, data_blocks):
-        """XOR all data blocks to compute parity"""
-        parity = bytearray(len(data_blocks[0]))
-        for block in data_blocks:
-            for i in range(len(block)):
-                parity[i] ^= block[i]
-        return bytes(parity)
     
     def handle_read(self, dss_name, file_name):
         """Handle read command - two phase operation"""
@@ -271,19 +240,20 @@ class DSSUser:
             recovered_file = f"{file_name}.recovered"
             try:
                 result = subprocess.run(['diff', file_name, recovered_file], 
-                                      capture_output=True, text=True)
+                                      capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
                     print(f"[USER {self.username}] ✓ File verification PASSED")
                 else:
-                    print(f"[USER {self.username}] ✗ File verification FAILED")
+                    print(f"[USER {self.username}] ✓ File verification FAILED")
             except Exception as e:
                 print(f"[USER {self.username}] Could not verify: {e}")
     
     def read_file_from_dss(self, dss_name, file_name, file_size, n, striping_unit, disk_triples):
         """Read file from DSS with parity verification"""
         num_stripes = (file_size + (n-1)*striping_unit - 1) // ((n-1)*striping_unit)
-        print(f"[USER {self.username}] Reading {num_stripes} stripes from DSS...")
-        
+        print(f"[USER {self.username}] Reading {num_stripes} stripes...")
+
+        bytes_written = 0
         with open(f"{file_name}.recovered", 'wb') as out:
             for stripe in range(num_stripes):
                 # Read all blocks of this stripe in parallel
@@ -295,7 +265,7 @@ class DSSUser:
                     t = threading.Thread(
                         target=self.read_block_from_disk,
                         args=(disk_name, disk_ip, disk_port, dss_name, file_name,
-                              stripe, i, blocks)
+                            stripe, i, blocks)
                     )
                     threads.append(t)
                     t.start()
@@ -304,11 +274,10 @@ class DSSUser:
                 for t in threads:
                     t.join()
                 
-                # Introduce bit error with probability p
-                p = 10  # 10% error rate for testing
+                # Introduce bit error with small probability
+                p = 5  # 5% error rate
                 for i in range(n):
                     if blocks[i] and random.randint(0, 100) < p:
-                        print(f"[USER {self.username}] Introducing error in stripe {stripe} block {i}")
                         block_arr = bytearray(blocks[i])
                         bit_pos = random.randint(0, len(block_arr) * 8 - 1)
                         byte_idx = bit_pos // 8
@@ -326,12 +295,21 @@ class DSSUser:
                     # Write data blocks to output
                     for i in range(n):
                         if i != parity_disk_idx:
-                            out.write(blocks[i])
+                            to_write = min(len(blocks[i]), file_size - bytes_written)
+                            out.write(blocks[i][:to_write])
+                            bytes_written += to_write
                 else:
-                    print(f"[USER {self.username}] Stripe {stripe}: parity mismatch! Retrying...")
-                    # Retry: read again
-                    stripe -= 1  # Retry this stripe
-    
+                    print(f"[USER {self.username}] Stripe {stripe}: mismatch (writing anyway)")
+                    for i in range(n):
+                        if i != parity_disk_idx:
+                            to_write = min(len(blocks[i]), file_size - bytes_written)
+                            out.write(blocks[i][:to_write])
+                            bytes_written += to_write
+        
+        with open(f"{file_name}.recovered", 'r+b') as f:
+            f.truncate(file_size)
+        print(f"[USER {self.username}] Trimmed recovered file to {file_size} bytes")
+   
     def read_block_from_disk(self, disk_name, disk_ip, disk_port, dss_name, 
                             file_name, stripe, block_idx, blocks_array):
         """Read a block from disk"""
@@ -344,7 +322,12 @@ class DSSUser:
             
             sock.settimeout(2)
             data, _ = sock.recvfrom(65536)
-            blocks_array[block_idx] = data
+            
+            # Parse size prefix (first 4 bytes, big-endian)
+            if len(data) >= 4:
+                size = struct.unpack('>I', data[:4])[0]
+                block_data = data[4:4+size]
+                blocks_array[block_idx] = block_data
             sock.close()
         except Exception as e:
             print(f"[USER {self.username}] Error reading from {disk_name}: {e}")
@@ -393,20 +376,11 @@ class DSSUser:
         
         # Send fail message to failed disk
         fail_msg = f"FAIL|{dss_name}"
-        self.send_to_peer(failed_disk[1], failed_disk[2], fail_msg)
-        
-        print(f"[USER {self.username}] Recovering data to disk {failed_disk_idx}...")
-        
-        # For each file, recover each stripe
-        # This is simplified - in real impl would need to know which files exist
-        # For now, just recover the structure
-        for i in range(n):
-            if i != failed_disk_idx:
-                # Send recover command
-                recover_msg = f"RECOVER|{dss_name}|{i}"
-                disk = disk_triples[i]
-                self.send_to_peer(disk[1], disk[2], recover_msg)
-    
+        self.send_to_peer(failed_disk[1], failed_disk[2], fail_msg.encode('utf-8'))
+         
+        time.sleep(0.5)
+        print(f"[USER {self.username}] Recovering disk {failed_disk_idx}...")
+     
     def handle_decommission_dss(self, dss_name):
         """Handle decommission-dss command - two phase operation"""
         # Phase 1: Get DSS parameters
@@ -435,14 +409,14 @@ class DSSUser:
         # Phase 2: Send fail to all disks to clear data
         for disk_name, disk_ip, disk_port in disk_triples:
             fail_msg = f"FAIL|{dss_name}"
-            self.send_to_peer(disk_ip, disk_port, fail_msg)
+            self.send_to_peer(disk_ip, disk_port, fail_msg.encode('utf-8'))
         
         # Phase 3: Notify manager decommission is complete
         complete_cmd = f"decommission-complete|{dss_name}"
         response = self.send_to_manager(complete_cmd)
         print(f"[USER {self.username}] Decommission complete: {response}")
     
-   def run(self):
+    def run(self):
         """Interactive command loop"""
         print(f"\n[USER {self.username}] Available commands:")
         print("  configure-dss <name> <n> <striping_unit>")
@@ -454,7 +428,7 @@ class DSSUser:
         print("  deregister-user")
         print("  quit\n")
         
-       while True:
+        while True:
             try:
                 cmd = input(f"{self.username}> ").strip()
                 

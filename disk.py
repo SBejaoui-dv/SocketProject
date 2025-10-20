@@ -3,6 +3,7 @@
 import socket
 import sys
 import threading
+import struct
 
 class DSSDisk:
     def __init__(self, diskname, manager_ip, manager_port, m_port, c_port):
@@ -14,6 +15,7 @@ class DSSDisk:
 
         # Storage: {dss_name: {file_name: {stripe: {block_idx: block_data}}}}
         self.storage = {}
+        self.lock = threading.Lock()
 
         # Create sockets
         self.m_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -100,10 +102,10 @@ class DSSDisk:
                 msg_type = parts[0]
                 
                 if msg_type == "WRITE_BLOCK":
-                    # Format: WRITE_BLOCK|dss_name|file_name|stripe|block_idx|block_type
-                    dss_name, file_name, stripe, block_idx, block_type = parts[1:6]
+                    # Format: WRITE_BLOCK|dss_name|file_name|stripe|block_idx|block_type|block_size
+                    dss_name, file_name, stripe, block_idx, block_type, block_size = parts[1:7]
                     self.handle_write_block(dss_name, file_name, stripe, block_idx, 
-                                           block_type, body, addr)
+                                           block_type, int(block_size), body, addr)
                 
                 elif msg_type == "READ_BLOCK":
                     # Format: READ_BLOCK|dss_name|file_name|stripe|block_idx
@@ -125,24 +127,28 @@ class DSSDisk:
                 break
 
     def handle_write_block(self, dss_name, file_name, stripe, block_idx, 
-                          block_type, block_data, addr):
+                          block_type, block_size, block_data, addr):
         """Store a block from user."""
         stripe = int(stripe)
         block_idx = int(block_idx)
         
-        # Initialize storage structure if needed
-        if dss_name not in self.storage:
-            self.storage[dss_name] = {}
-        if file_name not in self.storage[dss_name]:
-            self.storage[dss_name][file_name] = {}
-        if stripe not in self.storage[dss_name][file_name]:
-            self.storage[dss_name][file_name][stripe] = {}
+        # Extract exact block size from body
+        actual_block = block_data[:block_size]
         
-        # Store the block
-        self.storage[dss_name][file_name][stripe][block_idx] = block_data
+        with self.lock:
+            # Initialize storage structure if needed
+            if dss_name not in self.storage:
+                self.storage[dss_name] = {}
+            if file_name not in self.storage[dss_name]:
+                self.storage[dss_name][file_name] = {}
+            if stripe not in self.storage[dss_name][file_name]:
+                self.storage[dss_name][file_name][stripe] = {}
+            
+            # Store the block
+            self.storage[dss_name][file_name][stripe][block_idx] = actual_block
         
-        print(f"[DISK {self.diskname}] Stored {dss_name}/{file_name}/stripe{stripe}/block{block_idx}")
-        
+        print(f"[DISK {self.diskname}] Stored {dss_name}/{file_name}/stripe{stripe}/block{block_idx} ({len(actual_block)} bytes)")
+       
         # Send ACK back to user
         ack = f"WRITE_ACK|{dss_name}|{file_name}|{stripe}|{block_idx}"
         self.c_socket.sendto(ack.encode('utf-8'), addr)
@@ -153,21 +159,24 @@ class DSSDisk:
         block_idx = int(block_idx)
         
         block_data = b""
-        if (dss_name in self.storage and 
-            file_name in self.storage[dss_name] and
-            stripe in self.storage[dss_name][file_name] and
-            block_idx in self.storage[dss_name][file_name][stripe]):
-            block_data = self.storage[dss_name][file_name][stripe][block_idx]
+        with self.lock:
+            if (dss_name in self.storage and 
+                file_name in self.storage[dss_name] and
+                stripe in self.storage[dss_name][file_name] and
+                block_idx in self.storage[dss_name][file_name][stripe]):
+                block_data = self.storage[dss_name][file_name][stripe][block_idx]
         
-        print(f"[DISK {self.diskname}] Read {dss_name}/{file_name}/stripe{stripe}/block{block_idx}")
+        print(f"[DISK {self.diskname}] Read {dss_name}/{file_name}/stripe{stripe}/block{block_idx} ({len(block_data)} bytes)")
         
-        # Send block back
-        self.c_socket.sendto(block_data, addr)
+        # Send block back with size prefix (4-byte big-endian)
+        size_bytes = struct.pack('>I', len(block_data))
+        self.c_socket.sendto(size_bytes + block_data, addr)
 
     def handle_fail(self, dss_name, addr):
         """Simulate disk failure by clearing data for this DSS."""
-        if dss_name in self.storage:
-            del self.storage[dss_name]
+        with self.lock:
+            if dss_name in self.storage:
+                del self.storage[dss_name]
         
         print(f"[DISK {self.diskname}] Failed DSS {dss_name} - data cleared")
         
